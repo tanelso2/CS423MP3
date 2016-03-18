@@ -4,14 +4,9 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
-#include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/kthread.h>
 #include <linux/mutex.h> 
-#include <linux/sched.h>
-#include <linux/timer.h>
 #include <linux/string.h>
-#include <linux/spinlock.h>
 #include "mp3_given.h"
 
 #define DEBUG 1
