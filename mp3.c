@@ -34,15 +34,8 @@ struct kmem_cache * mp3_cachep;
 static char input_buf[80];
 static char output_buf[160];
 
-// Profile buffer
-struct profile_buffer_data_struct {
-	unsigned long jiffies;
-	unsigned long minor_fault_count;
-	unsigned long major_fault_count;
-	unsigned long cpu_util;
-};
-
-struct profile_buffer_data_struct *profile_buffer;
+// profile buffer
+unsigned long *profile_buffer;
 
 size_t write_offset = 0;
 
@@ -69,19 +62,9 @@ struct mp3_task_struct {
 	int minor_fault_count;
 };
 
-/*
- * Write to ring buffer
- */
-void write_ring_buffer(struct profile_buffer_data_struct data) {
-	profile_buffer[write_offset] = data;
-	write_offset = (write_offset + 1) % 12000;
-}
-
 void work_callback(struct work_struct *work) {
-	// get info
-	struct profile_buffer_data_struct data;
-	memset(&data, 0, sizeof(struct profile_buffer_data_struct));
-	data.jiffies = jiffies;		
+	unsigned long minor_fault_count, major_fault_count, cpu_util;
+	minor_fault_count = major_fault_count = cpu_util = 0;
 
 	struct mp3_task_struct *iter;
 	unsigned long min_fault, maj_fault, u_time, s_time;
@@ -89,15 +72,22 @@ void work_callback(struct work_struct *work) {
 	// Lock list, traverse 'safe' because we remove entry
 	mutex_lock_interruptible(&list_lock);
     list_for_each_entry(iter, &task_list, list) {
-    	int success = get_cpu_use(iter->pid, &min_fault, &maj_fault, &u_time, &s_time);
-		if (success) {
-			// TODO
-			data.cpu_util += 0;
-			data.minor_fault_count += min_fault;
-			data.major_fault_count += maj_fault;
+    	int fail = get_cpu_use(iter->pid, &min_fault, &maj_fault, &u_time, &s_time);
+		if (!fail) {
+			// Get data for process
+			cpu_util += 100 * (cputime_to_jiffies(u_time) + cputime_to_jiffies(s_time)) / msecs_to_jiffies(50);
+			minor_fault_count += min_fault;
+			major_fault_count += maj_fault;
 		}
 	}
 	mutex_unlock(&list_lock); // Unlock list
+
+	// Write to buffer
+	profile_buffer[write_offset] = minor_fault_count;
+	profile_buffer[write_offset + 1] = major_fault_count;
+	profile_buffer[write_offset + 2] = cpu_util;
+	profile_buffer[write_offset + 3] = jiffies;
+	write_offset = (write_offset + 4) % 48000;
 
 	// Sched delayed work
 	INIT_DELAYED_WORK(&dwork, work_callback);
@@ -150,13 +140,17 @@ void mp3_deregister(void) {
 	list_for_each_safe(pos, q, &task_list) {
 		curr = list_entry(pos, struct mp3_task_struct, list);
 		if(curr->pid == pid) {
+
 			list_del(pos);
 			kmem_cache_free(mp3_cachep, curr);
 			list_size -= 1;
+
 			if (!list_size) {
+				cancel_delayed_work(&dwork);
 				flush_workqueue(wq);
 				destroy_workqueue(wq);
 			}
+
 		}
 	}
 	mutex_unlock(&list_lock);
@@ -264,7 +258,7 @@ int __init mp3_init(void) {
 	proc_entry = proc_create("status", 0666, proc_dir, &mp3_file);
 
 	// Create char device driver
-	alloc_chrdev_region(&mp3_dev_no, 0, 1, "node");
+	alloc_chrdev_region(&mp3_dev_no, 0, 1, "mp3");
 	cdev_init(&mp3_cdev, &mp3_cdev_fops);
 	cdev_add(&mp3_cdev, mp3_dev_no, 1);
 
@@ -291,6 +285,11 @@ void __exit mp3_exit(void) {
 	// Delete dev driver
 	cdev_del(&mp3_cdev);
 	unregister_chrdev_region(mp3_dev_no, 1);
+
+	// Clean work queue
+	cancel_delayed_work(&dwork);
+	flush_workqueue(wq);
+	destroy_workqueue(wq);
 
 	printk(KERN_ALERT "MP3 MODULE UNLOADED\n");
 }
