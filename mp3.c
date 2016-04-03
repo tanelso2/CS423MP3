@@ -3,10 +3,14 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h> 
+#include <linux/workqueue.h>
 #include <linux/string.h>
+#include <linux/mm.h>
+#include <linux/cdev.h>
 #include "mp3_given.h"
 
 #define DEBUG 1
@@ -19,6 +23,10 @@ MODULE_DESCRIPTION("CS-423 MP3");
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_entry;
 
+// Character device driver
+static struct cdev mp3_cdev;
+static dev_t mp3_dev_no;
+
 // Cache
 struct kmem_cache * mp3_cachep;
 
@@ -27,14 +35,21 @@ static char input_buf[80];
 static char output_buf[160];
 
 // Profile buffer
-void * profile_buffer;
+struct profile_buffer_data_struct {
+	unsigned long jiffies;
+	unsigned long minor_fault_count;
+	unsigned long major_fault_count;
+	unsigned long cpu_util;
+};
 
+struct profile_buffer_data_struct *profile_buffer;
+
+size_t write_offset = 0;
+
+// Work queue
 static struct workqueue_struct *wq;
 
-struct our_work_struct {
-	struct work_struct work;
-};
-static struct our_work_struct ows;
+struct delayed_work dwork;
 
 int list_size;
 
@@ -54,9 +69,39 @@ struct mp3_task_struct {
 	int minor_fault_count;
 };
 
+/*
+ * Write to ring buffer
+ */
+void write_ring_buffer(struct profile_buffer_data_struct data) {
+	profile_buffer[write_offset] = data;
+	write_offset = (write_offset + 1) % 12000;
+}
+
 void work_callback(struct work_struct *work) {
-	INIT_WORK(&ows.work, work_callback);
-	queue_delayed_work(wq,&ows.work,msecs_to_jiffies(50));
+	// get info
+	struct profile_buffer_data_struct data;
+	memset(&data, 0, sizeof(struct profile_buffer_data_struct));
+	data.jiffies = jiffies;		
+
+	struct mp3_task_struct *iter;
+	unsigned long min_fault, maj_fault, u_time, s_time;
+	
+	// Lock list, traverse 'safe' because we remove entry
+	mutex_lock_interruptible(&list_lock);
+    list_for_each_entry(iter, &task_list, list) {
+    	int success = get_cpu_use(iter->pid, &min_fault, &maj_fault, &u_time, &s_time);
+		if (success) {
+			// TODO
+			data.cpu_util += 0;
+			data.minor_fault_count += min_fault;
+			data.major_fault_count += maj_fault;
+		}
+	}
+	mutex_unlock(&list_lock); // Unlock list
+
+	// Sched delayed work
+	INIT_DELAYED_WORK(&dwork, work_callback);
+	queue_delayed_work(wq, &dwork, msecs_to_jiffies(50));
 }
 
 /*
@@ -65,14 +110,13 @@ void work_callback(struct work_struct *work) {
 void mp3_register(void) {
     int pid;
 	struct mp3_task_struct * new_task_entry;
-	unsigned long cpu_use;
 	// Read new task from input buffer
 	sscanf(input_buf, "R, %d", &pid);
 
 	new_task_entry = kmem_cache_alloc(mp3_cachep, GFP_KERNEL);
 
 	new_task_entry -> pid = pid;
-	new_task_entry -> cpu_use = cpu_use;
+	new_task_entry -> cpu_use = 0;
 	new_task_entry -> major_fault_count = 0;
 	new_task_entry -> minor_fault_count = 0;
 
@@ -82,9 +126,9 @@ void mp3_register(void) {
 	if (!list_size) {
 		// Create work queue
 		wq = create_singlethread_workqueue("mp3_wq");
-		INIT_WORK(&ows.work, work_callback);
+		INIT_DELAYED_WORK(&dwork, work_callback);
 
-		queue_delayed_work(wq,&ows.work,msecs_to_jiffies(50));
+		queue_delayed_work(wq,&dwork,msecs_to_jiffies(50));
 	}
 	list_add(&new_task_entry->list, &task_list);
 	list_size += 1;
@@ -166,12 +210,44 @@ static ssize_t mp3_read(struct file *file, char __user *buffer, size_t count, lo
 }
 
 /*
+ * Character device driver
+ */
+
+static int cdev_mmap(struct file *file, struct vm_area_struct *vm_area) {
+	int i;
+	for (i = 0; i < 128; i++) {
+		unsigned long pfn = vmalloc_to_pfn((char *)profile_buffer + i * PAGE_SIZE);
+		remap_pfn_range(vm_area, vm_area->vm_start + i * PAGE_SIZE, pfn, PAGE_SIZE, PAGE_SHARED);
+	}
+	return 0;
+}
+
+static int cdev_open(struct inode *inode, struct file *file) {
+	return 0;
+}
+
+static int cdev_release(struct inode *inode, struct file *file) {
+	return 0;
+}
+
+/*
  * Static procfile struct
  */
 static const struct file_operations mp3_file = {
 	.owner = THIS_MODULE,
 	.read = mp3_read,
 	.write = mp3_write,
+};
+
+/* 
+ * Static cdev struct 
+ */
+
+static const struct file_operations mp3_cdev_fops = {
+	.owner = THIS_MODULE,
+	.release = cdev_release,
+	.open = cdev_open,
+	.mmap = cdev_mmap
 };
 
 /*
@@ -187,7 +263,13 @@ int __init mp3_init(void) {
 	proc_dir = proc_mkdir("mp3", NULL); 
 	proc_entry = proc_create("status", 0666, proc_dir, &mp3_file);
 
-	profile_buffer = vmalloc(128 * 4 * 1024, PG_reserved);
+	// Create char device driver
+	alloc_chrdev_region(&mp3_dev_no, 0, 1, "node");
+	cdev_init(&mp3_cdev, &mp3_cdev_fops);
+	cdev_add(&mp3_cdev, mp3_dev_no, 1);
+
+	// Procfile buffer
+	profile_buffer = vmalloc(128 * PAGE_SIZE);
 
 	printk(KERN_ALERT "MP3 MODULE LOADED\n");
 	return 0;
@@ -202,12 +284,13 @@ void __exit mp3_exit(void) {
 	printk(KERN_ALERT "MP3 MODULE UNLOADING\n");
 	#endif
 
-
 	// Remove proc file
 	remove_proc_entry("status", proc_dir);
 	remove_proc_entry("mp3", NULL);
 
-	// Clean cache
+	// Delete dev driver
+	cdev_del(&mp3_cdev);
+	unregister_chrdev_region(mp3_dev_no, 1);
 
 	printk(KERN_ALERT "MP3 MODULE UNLOADED\n");
 }

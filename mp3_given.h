@@ -2,7 +2,7 @@
 #define __MP3_GIVEN_INCLUDE__
 
 #include <linux/pid.h>
-
+#include <linux/sched.h>
 struct task_struct* find_task_by_pid(unsigned int nr)
 {
     struct task_struct* task = NULL;
