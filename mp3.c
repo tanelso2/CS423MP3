@@ -11,10 +11,6 @@
 
 #define DEBUG 1
 
-#define TSK_SLEEPING 0
-#define TSK_RUNNING 1
-#define TSK_READY 2
-
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Group_06");
 MODULE_DESCRIPTION("CS-423 MP3");
@@ -23,9 +19,24 @@ MODULE_DESCRIPTION("CS-423 MP3");
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_entry;
 
+// Cache
+struct kmem_cache * mp3_cachep;
+
 // IO buffers
 static char input_buf[80];
 static char output_buf[160];
+
+// Profile buffer
+void * profile_buffer;
+
+static struct workqueue_struct *wq;
+
+struct our_work_struct {
+	struct work_struct work;
+};
+static struct our_work_struct ows;
+
+int list_size;
 
 // Task list
 LIST_HEAD(task_list);
@@ -33,15 +44,51 @@ LIST_HEAD(task_list);
 // Locks
 DEFINE_MUTEX(list_lock);
 
+struct mp3_task_struct {
+	struct task_struct* linux_task;
+	struct list_head list;
+
+	int pid;
+	int cpu_use;
+	int major_fault_count;
+	int minor_fault_count;
+};
+
+void work_callback(struct work_struct *work) {
+	INIT_WORK(&ows.work, work_callback);
+	queue_delayed_work(wq,&ows.work,msecs_to_jiffies(50));
+}
+
 /*
  * Registers task to list from global input buffer
  */
 void mp3_register(void) {
-    //TODO: Implement
-    int pid; 
-
+    int pid;
+	struct mp3_task_struct * new_task_entry;
+	unsigned long cpu_use;
 	// Read new task from input buffer
 	sscanf(input_buf, "R, %d", &pid);
+
+	new_task_entry = kmem_cache_alloc(mp3_cachep, GFP_KERNEL);
+
+	new_task_entry -> pid = pid;
+	new_task_entry -> cpu_use = cpu_use;
+	new_task_entry -> major_fault_count = 0;
+	new_task_entry -> minor_fault_count = 0;
+
+	new_task_entry->linux_task = find_task_by_pid(new_task_entry->pid);
+
+	mutex_lock_interruptible(&list_lock);
+	if (!list_size) {
+		// Create work queue
+		wq = create_singlethread_workqueue("mp3_wq");
+		INIT_WORK(&ows.work, work_callback);
+
+		queue_delayed_work(wq,&ows.work,msecs_to_jiffies(50));
+	}
+	list_add(&new_task_entry->list, &task_list);
+	list_size += 1;
+	mutex_unlock(&list_lock);
 }
 
 /*
@@ -51,6 +98,24 @@ void mp3_deregister(void) {
     //TODO: implement 
 	int pid;
 	sscanf(input_buf, "D, %d", &pid);
+
+	struct list_head *pos, *q;
+	struct mp3_task_struct *curr;
+
+	mutex_lock_interruptible(&list_lock);
+	list_for_each_safe(pos, q, &task_list) {
+		curr = list_entry(pos, struct mp3_task_struct, list);
+		if(curr->pid == pid) {
+			list_del(pos);
+			kmem_cache_free(mp3_cachep, curr);
+			list_size -= 1;
+			if (!list_size) {
+				flush_workqueue(wq);
+				destroy_workqueue(wq);
+			}
+		}
+	}
+	mutex_unlock(&list_lock);
 }
 
 /*
@@ -121,7 +186,9 @@ int __init mp3_init(void) {
 	// Create procfile
 	proc_dir = proc_mkdir("mp3", NULL); 
 	proc_entry = proc_create("status", 0666, proc_dir, &mp3_file);
-	
+
+	profile_buffer = vmalloc(128 * 4 * 1024, PG_reserved);
+
 	printk(KERN_ALERT "MP3 MODULE LOADED\n");
 	return 0;
 }
