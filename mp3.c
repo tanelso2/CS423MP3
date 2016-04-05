@@ -12,9 +12,10 @@
 #include <linux/mm.h>
 #include <linux/cdev.h>
 #include "mp3_given.h"
+#include <linux/slab.h>
 
 #define DEBUG 1
-
+#define NUMPAGES 128
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Group_06");
 MODULE_DESCRIPTION("CS-423 MP3");
@@ -44,8 +45,6 @@ static struct workqueue_struct *wq;
 
 struct delayed_work dwork;
 
-int list_size;
-
 // Task list
 LIST_HEAD(task_list);
 
@@ -56,10 +55,7 @@ struct mp3_task_struct {
 	struct task_struct* linux_task;
 	struct list_head list;
 
-	int pid;
-	int cpu_use;
-	int major_fault_count;
-	int minor_fault_count;
+	unsigned int pid;
 };
 
 void work_callback(struct work_struct *work) {
@@ -72,6 +68,8 @@ void work_callback(struct work_struct *work) {
 	// Lock list, traverse 'safe' because we remove entry
 	mutex_lock_interruptible(&list_lock);
     list_for_each_entry(iter, &task_list, list) {
+		
+		printk(KERN_ALERT "Getting CPU use for: %d\n" , iter->pid);
     	int fail = get_cpu_use(iter->pid, &min_fault, &maj_fault, &u_time, &s_time);
 		if (!fail) {
 			// Get data for process
@@ -98,30 +96,27 @@ void work_callback(struct work_struct *work) {
  * Registers task to list from global input buffer
  */
 void mp3_register(void) {
-    int pid;
+    unsigned int pid;
 	struct mp3_task_struct * new_task_entry;
 	// Read new task from input buffer
-	sscanf(input_buf, "R, %d", &pid);
+	sscanf(input_buf, "R %u", &pid);
+	printk(KERN_ALERT "Pid is %u\n" , pid);
 
 	new_task_entry = kmem_cache_alloc(mp3_cachep, GFP_KERNEL);
-
-	new_task_entry -> pid = pid;
-	new_task_entry -> cpu_use = 0;
-	new_task_entry -> major_fault_count = 0;
-	new_task_entry -> minor_fault_count = 0;
-
+	new_task_entry->pid = pid;
 	new_task_entry->linux_task = find_task_by_pid(new_task_entry->pid);
 
 	mutex_lock_interruptible(&list_lock);
-	if (!list_size) {
+	//printk( KERN_ALERT  );
+	if (list_empty(&task_list)) {
 		// Create work queue
+		printk( KERN_ALERT "Created the work queue.\n");
 		wq = create_singlethread_workqueue("mp3_wq");
 		INIT_DELAYED_WORK(&dwork, work_callback);
 
 		queue_delayed_work(wq,&dwork,msecs_to_jiffies(50));
 	}
 	list_add(&new_task_entry->list, &task_list);
-	list_size += 1;
 	mutex_unlock(&list_lock);
 }
 
@@ -131,7 +126,7 @@ void mp3_register(void) {
 void mp3_deregister(void) {
     //TODO: implement 
 	int pid;
-	sscanf(input_buf, "D, %d", &pid);
+	sscanf(input_buf, "U %d", &pid);
 
 	struct list_head *pos, *q;
 	struct mp3_task_struct *curr;
@@ -143,15 +138,15 @@ void mp3_deregister(void) {
 
 			list_del(pos);
 			kmem_cache_free(mp3_cachep, curr);
-			list_size -= 1;
-
-			if (!list_size) {
-				cancel_delayed_work(&dwork);
-				flush_workqueue(wq);
-				destroy_workqueue(wq);
-			}
 
 		}
+	}
+	
+	if (list_empty(&task_list)) {
+		printk( KERN_ALERT "Work queue destroy. \n");
+		cancel_delayed_work_sync(&dwork);
+		flush_workqueue(wq);
+		destroy_workqueue(wq);
 	}
 	mutex_unlock(&list_lock);
 }
@@ -164,7 +159,7 @@ static ssize_t mp3_write(struct file *file, const char __user *buffer, size_t co
 	if (copy_from_user(input_buf, buffer, count) ) {
 		return -EFAULT;
 	}
-
+	printk(KERN_ALERT "input_buf is: %s\n", input_buf);
 	// Call appropriate action function
 	switch (input_buf[0]) {
 		case 'R':
@@ -208,11 +203,15 @@ static ssize_t mp3_read(struct file *file, char __user *buffer, size_t count, lo
  */
 
 static int cdev_mmap(struct file *file, struct vm_area_struct *vm_area) {
-	int i;
-	for (i = 0; i < 128; i++) {
-		unsigned long pfn = vmalloc_to_pfn((char *)profile_buffer + i * PAGE_SIZE);
-		remap_pfn_range(vm_area, vm_area->vm_start + i * PAGE_SIZE, pfn, PAGE_SIZE, PAGE_SHARED);
+	struct mm_struct *mm = vm_area->vm_mm;
+
+	down_write(&mm->mmap_sem);
+	int i = 0;
+	for (i = 0; i < NUMPAGES; i++) {
+		unsigned long pfn = vmalloc_to_pfn( (void*) profile_buffer + i * PAGE_SIZE);
+		int ret = remap_pfn_range(vm_area, vm_area->vm_start + i * PAGE_SIZE, pfn, PAGE_SIZE, vm_area->vm_page_prot);
 	}
+	up_write(&mm->mmap_sem);
 	return 0;
 }
 
@@ -257,14 +256,19 @@ int __init mp3_init(void) {
 	proc_dir = proc_mkdir("mp3", NULL); 
 	proc_entry = proc_create("status", 0666, proc_dir, &mp3_file);
 
+	mp3_cachep = kmem_cache_create("mp3_tasks", sizeof(struct mp3_task_struct), ARCH_MIN_TASKALIGN, SLAB_PANIC, NULL);
+
 	// Create char device driver
 	alloc_chrdev_region(&mp3_dev_no, 0, 1, "mp3");
 	cdev_init(&mp3_cdev, &mp3_cdev_fops);
 	cdev_add(&mp3_cdev, mp3_dev_no, 1);
 
 	// Procfile buffer
-	profile_buffer = vmalloc(128 * PAGE_SIZE);
-
+	profile_buffer = vmalloc(NUMPAGES * PAGE_SIZE);
+	int i;
+	for (i = 0; i < NUMPAGES * PAGE_SIZE; i += PAGE_SIZE) {
+		SetPageReserved(vmalloc_to_page((void*)(((unsigned long)profile_buffer) + i)));	
+	}
 	printk(KERN_ALERT "MP3 MODULE LOADED\n");
 	return 0;
 }
@@ -285,11 +289,14 @@ void __exit mp3_exit(void) {
 	// Delete dev driver
 	cdev_del(&mp3_cdev);
 	unregister_chrdev_region(mp3_dev_no, 1);
-
+	/*
 	// Clean work queue
 	cancel_delayed_work(&dwork);
 	flush_workqueue(wq);
 	destroy_workqueue(wq);
+	*/
+	// Clean cache 
+	kmem_cache_destroy(mp3_cachep);
 
 	printk(KERN_ALERT "MP3 MODULE UNLOADED\n");
 }
