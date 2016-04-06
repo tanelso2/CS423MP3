@@ -52,7 +52,7 @@ for entry in data:
 data_np = np.array(data)
 print data_np
 
-
+plt.figure()
 plt.plot(data_np[:,3], page_fault_accum)
 plt.title("Profile 2")
 plt.xlabel("Jiffies")
