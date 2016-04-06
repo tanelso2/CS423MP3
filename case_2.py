@@ -19,7 +19,7 @@ for entry in data:
  	entry[3] = int(entry[3].rstrip())
 	cpu_total += entry[2]
 
-cpu_1_avr = cpu_total / len(data)
+cpu_1_avr = float(cpu_total) / len(data)
 
 
 # MULTI 5
@@ -37,7 +37,7 @@ for entry in data:
  	entry[3] = int(entry[3].rstrip())
 	cpu_total += entry[2]
 
-cpu_5_avr = cpu_total / len(data)
+cpu_5_avr = float(cpu_total) / len(data)
 
 
 
@@ -56,7 +56,7 @@ for entry in data:
  	entry[3] = int(entry[3].rstrip())
 	cpu_total += entry[2]
 
-cpu_11_avr = cpu_total / len(data)
+cpu_11_avr = float(cpu_total) / len(data)
 
 
 # Graph Here 
@@ -68,12 +68,9 @@ index = np.arange(3)
 plt.bar(index, cpu_averages, bar_width)
 
 plt.xlabel('N Processes')
-plt.ylabel('Average CPU Utilization')
-plt.title('Average CPU Utilization vs. # of Work Processes')
-plt.xticks(index + bar_width, ('N=1', 'N=5', 'N=11'))
-plt.legend()
-
-plt.tight_layout()
+plt.ylabel('Average % CPU Utilization')
+plt.title('Average % CPU Utilization vs. # of Work Processes')
+plt.xticks(index + bar_width/2, ('N=1', 'N=5', 'N=11'))
 plt.savefig("multi_graph.png")
 
 
