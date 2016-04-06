@@ -202,17 +202,31 @@ static ssize_t mp3_read(struct file *file, char __user *buffer, size_t count, lo
  * Character device driver
  */
 
-static int cdev_mmap(struct file *file, struct vm_area_struct *vm_area) {
-	struct mm_struct *mm = vm_area->vm_mm;
+static int cdev_mmap(struct file *file, struct vm_area_struct *vma) {
+	
+	int ret;  
+	long length = vma->vm_end - vma->vm_start;  
+	unsigned long start = vma->vm_start;  
+	char *vmalloc_area_ptr = (char *)profile_buffer;  
+	unsigned long pfn;  
 
-	down_write(&mm->mmap_sem);
-	int i = 0;
-	for (i = 0; i < NUMPAGES; i++) {
-		unsigned long pfn = vmalloc_to_pfn( (void*) profile_buffer + i * PAGE_SIZE);
-		int ret = remap_pfn_range(vm_area, vm_area->vm_start + i * PAGE_SIZE, pfn, PAGE_SIZE, vm_area->vm_page_prot);
-	}
-	up_write(&mm->mmap_sem);
-	return 0;
+	/* check length - do not allow larger mappings than the number of 
+	   pages allocated */  
+	if (length > NUMPAGES * PAGE_SIZE)  
+			return -EIO;  
+
+	/* loop over all pages, map it page individually */  
+	while (length > 0) {  
+			pfn = vmalloc_to_pfn(vmalloc_area_ptr);  
+			if ((ret = remap_pfn_range(vma, start, pfn, PAGE_SIZE,  
+									   PAGE_SHARED)) < 0) {  
+					return ret;  
+			}  
+			start += PAGE_SIZE;  
+			vmalloc_area_ptr += PAGE_SIZE;  
+			length -= PAGE_SIZE;  
+	}  
+	return 0;  	
 }
 
 static int cdev_open(struct inode *inode, struct file *file) {
@@ -265,6 +279,7 @@ int __init mp3_init(void) {
 
 	// Procfile buffer
 	profile_buffer = vmalloc(NUMPAGES * PAGE_SIZE);
+	memset(profile_buffer, -1, NUMPAGES * PAGE_SIZE);
 	int i;
 	for (i = 0; i < NUMPAGES * PAGE_SIZE; i += PAGE_SIZE) {
 		SetPageReserved(vmalloc_to_page((void*)(((unsigned long)profile_buffer) + i)));	
